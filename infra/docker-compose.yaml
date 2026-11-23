@@ -1,0 +1,193 @@
+services:
+  # ~/clickstream-lakehouse/infra/docker-compose.yaml
+  #  MODERN EVENT BROKER: Apache Kafka in Native KRaft Mode (No ZooKeeper!)
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0  # Stable production KRaft engine line
+    container_name: lakehouse_kafka
+    ports:
+      - "9092:9092"
+    networks:
+      - lakehouse_net
+    environment:
+      #  KRaft Mode Controller Activations
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093'
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      # Generated Cluster ID token for KRaft storage virtualization mapping
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk' 
+      # ️ THE 10GB SPACE GUARDRAILS:
+      # Automatically purges old log segments when the topics hit a combined 5GB
+      KAFKA_LOG_RETENTION_BYTES: 5368709120
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+
+    volumes:
+      - ./kafka-data:/var/lib/kafka/data:rw
+    
+    # healthcheck:
+    #   test: ["CMD-SHELL", "kafka-cluster cluster-id --bootstrap-server localhost:9092 || kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    #  HEALTHCHECK: Probes port 9092 internally to ensure the KRaft broker is ready to accept text streams!
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 5      
+
+    # 烙 THE BOT SIMULATOR: Modular Data Generator (Auto-Compiles your Python factory)
+  generator:
+    build: ../generator/             #  Flat clean path pointing to your parent directory
+    image: clickstream-generator:latest
+    container_name: lakehouse_generator
+    networks:
+      - lakehouse_net
+    depends_on:
+      - kafka
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          
+  # 易 THE STREAM DISTRIBUTOR: Apache Spark 4.0 Distributed Master Node
+  spark-master:
+    image: apache/spark:4.0.0-python3
+    container_name: lakehouse_spark_master
+    networks:
+      - lakehouse_net
+    #  DEPENDENCY CONDITION: Only boots after BOTH Postgres and Kafka pass their health checks!
+    depends_on:
+      catalog-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    ports:
+      - "8082:8080" # Spark Web UI exposed on 8082 to clear Trino!
+      - "7077:7077"
+    user: root
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master
+    volumes:
+      - ../spark-jobs:/opt/spark-apps
+      - shared_warehouse:/opt/spark/warehouse # Direct Host SSD storage mount
+      - ../spark-jobs/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+
+  # ⚙️ THE DISTRIBUTED WORKER: Apache Spark 4.0 Parallel Execution Node
+  spark-worker:
+    image: apache/spark:4.0.0-python3
+    container_name: lakehouse_spark_worker
+    networks:
+      - lakehouse_net
+    dns:
+      - 8.8.8.8
+    depends_on:
+      - spark-master
+    user: root
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+    volumes:
+      - ../spark-jobs:/opt/spark-apps
+      - shared_warehouse:/opt/spark/warehouse:rw
+      - ../spark-jobs/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+
+  #  THE TRANSLATOR BRIDGE: High-Speed SQL Query Engine (Trino Core)
+  trino:
+    image: trinodb/trino:latest
+    container_name: lakehouse_trino
+    ports:
+      - "8083:8080" # Trino exposed on 8083 to resolve port assignment conflicts!
+    networks:
+      - lakehouse_net
+     #  DEPENDENCY CONDITION: Only boots after the PostgreSQL catalog index ledger is fully active!
+    depends_on:
+      catalog-db:
+        condition: service_healthy
+    volumes:
+      - ${PWD}/trino-catalog:/etc/trino/catalog:ro
+      - shared_warehouse:/opt/spark/warehouse:rw
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  #  THE PRESENTATION LAYER: Graphical Business Intelligence Dashboard (Apache Superset)
+  superset:
+    image: apache/superset:latest
+    container_name: lakehouse_dashboards
+    ports:
+      - "8088:8088"
+    networks:
+      - lakehouse_net
+     #  DEPENDENCY CONDITION: Superset will wait until Trino is completely healthy before booting!
+    depends_on:
+      trino:
+        condition: service_healthy  
+    user: root
+    environment:
+      - SUPERSET_SECRET_KEY=super_secret_cryptographic_signing_key_12345
+    # Automatically installs Trino drivers via uv and creates user credentials on launch
+    command: >
+      sh -c "uv pip install --python /app/.venv/bin/python sqlalchemy-trino trino &&
+             superset db upgrade;
+             superset fab create-admin --username admin --firstname Data --lastname Engineer --email admin@lakehouse.local --password admin;
+             superset init;
+             superset run -p 8088 -h 0.0.0.0 --with-threads"
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+
+   # ️ THE LEDGER: Central Database Catalog Store (PostgreSQL)
+  catalog-db:
+    image: postgres:16-alpine
+    container_name: lakehouse_catalog_db
+    networks:
+      - lakehouse_net
+    environment:
+      - POSTGRES_USER=catalog_admin
+      - POSTGRES_PASSWORD=super_secret_catalog_password_123
+      - POSTGRES_DB=iceberg_catalog
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 1G  
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catalog_admin -d iceberg_catalog"]
+      interval: 5s
+      timeout: 5s
+      retries: 5            
+
+networks:
+  lakehouse_net:
+    driver: bridge
+
+volumes:
+  #pgdata: #  Essential: Registers the persistent storage disk partition for Postgres!
+  shared_warehouse:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/../warehouse    
